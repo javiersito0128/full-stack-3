@@ -3,10 +3,18 @@ from django.contrib import messages
 from .models import Activo, PerfilUsuario, Empresa, Ticket
 from .forms import LoginForm, TicketForm, ActivoForm, CerrarTicketForm
 from django.contrib.auth.decorators import login_required
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from django.utils import timezone
 from .decorators import admin_required, tecnico_required, cliente_required
-from django.contrib.auth import logout
+from django.contrib.auth import logout, authenticate, login
+from django.contrib.auth.models import User
+import logging
+import json
+from django.views.decorators.csrf import csrf_exempt
+import secrets
+import string
+
+logger = logging.getLogger(__name__)
 
 @login_required
 def inicio(request):
@@ -65,27 +73,42 @@ def inicio(request):
         return redirect('login')
 
 def login_view(request):
-    if request.session.get('is_logged_in'):
-        return redirect('inventory_list')
+    logger.info(f"Login attempt - Method: {request.method}")
+    
+    if request.user.is_authenticated:
+        logger.info(f"User already authenticated: {request.user.username}")
+        return redirect('inicio')
+    
     if request.method == 'POST':
         form = LoginForm(request.POST)
+        logger.info(f"Form data received: {request.POST}")
+        
         if form.is_valid():
             username = form.cleaned_data['username']
             password = form.cleaned_data['password']
-            if username and password: 
-                request.session['is_logged_in'] = True
-                messages.success(request, 'Logged in successfully.')
-                return redirect('inventory_list')
+            
+            logger.info(f"Attempting authentication for username: {username}")
+            
+            user = authenticate(request, username=username, password=password)
+            
+            if user is not None:
+                logger.info(f"Authentication successful for user: {username}")
+                login(request, user)
+                messages.success(request, 'Inicio de sesión exitoso.')
+                return redirect('inicio')
             else:
-                messages.error(request, 'Please enter valid username and password.')
+                logger.warning(f"Authentication failed for username: {username}")
+                messages.error(request, 'Usuario o contraseña incorrectos.')
+        else:
+            logger.warning(f"Form validation failed: {form.errors}")
+            messages.error(request, 'Por favor, ingresa un usuario y contraseña válidos.')
     else:
         form = LoginForm()
+    
     return render(request, 'inventory/login.html', {'form': form})
 
+@login_required
 def inventory_list(request):
-    if not request.session.get('is_logged_in'):
-        messages.warning(request, 'Please log in to access the inventory.')
-        return redirect('login')
     return redirect('activos_por_empresa')
 
 @login_required
@@ -178,16 +201,28 @@ def crear_ticket(request):
 
 @login_required
 def get_activos_por_empresa(request):
-    """Vista AJAX para obtener activos por empresa"""
-    empresa_id = request.GET.get('empresa_id')
-    if empresa_id:
+    try:
+        empresa_id = request.GET.get('empresa_id')
+        if not empresa_id:
+            return JsonResponse([], safe=False)
+        
+        # Registrar información para depuración
+        logger.info(f"Buscando activos para empresa_id: {empresa_id}")
+        
+        # Obtener activos
         activos = Activo.objects.filter(empresa_id=empresa_id).values('id', 'nombre')
-        return JsonResponse(list(activos), safe=False)
-    return JsonResponse([], safe=False)
+        activos_list = list(activos)
+        
+        # Registrar cuántos activos se encontraron
+        logger.info(f"Se encontraron {len(activos_list)} activos para la empresa {empresa_id}")
+        
+        return JsonResponse(activos_list, safe=False)
+    except Exception as e:
+        logger.error(f"Error al obtener activos: {str(e)}")
+        return JsonResponse({'error': str(e)}, status=500)
 
 @admin_required
 def crear_activo(request):
-    """Vista para crear un nuevo activo (solo administradores)"""
     if request.method == 'POST':
         form = ActivoForm(request.POST)
         if form.is_valid():
@@ -201,7 +236,6 @@ def crear_activo(request):
 
 @admin_required
 def editar_activo(request, activo_id):
-    """Vista para editar un activo existente (solo administradores)"""
     activo = get_object_or_404(Activo, id=activo_id)
     
     if request.method == 'POST':
@@ -221,7 +255,6 @@ def editar_activo(request, activo_id):
 
 @tecnico_required
 def cerrar_ticket(request, ticket_id):
-    """Vista para cerrar un ticket (solo técnicos y administradores)"""
     ticket = get_object_or_404(Ticket, id=ticket_id)
     
     if ticket.estado == 'cerrado':
@@ -248,7 +281,6 @@ def cerrar_ticket(request, ticket_id):
 
 @tecnico_required
 def cambiar_estado_ticket(request, ticket_id, nuevo_estado):
-    """Vista para cambiar el estado de un ticket (solo técnicos y administradores)"""
     ticket = get_object_or_404(Ticket, id=ticket_id)
     estados_validos = [estado[0] for estado in Ticket.ESTADO_CHOICES]
     
@@ -273,3 +305,507 @@ def cambiar_estado_ticket(request, ticket_id, nuevo_estado):
 def logout_view(request):
     logout(request)
     return redirect('login')
+
+# Vista para depurar los activos
+@login_required
+def debug_activos(request):
+    try:
+        # Obtener todas las empresas
+        empresas = Empresa.objects.all()
+        
+        # Preparar datos para mostrar
+        datos = []
+        
+        for empresa in empresas:
+            activos = Activo.objects.filter(empresa=empresa)
+            
+            datos.append({
+                'empresa': {
+                    'id': empresa.id,
+                    'nombre': empresa.nombre,
+                    'nit': empresa.nit
+                },
+                'activos': [
+                    {
+                        'id': activo.id,
+                        'nombre': activo.nombre,
+                        'tipo': activo.tipo
+                    } for activo in activos
+                ],
+                'activos_count': activos.count()
+            })
+        
+        # Obtener usuarios y sus perfiles
+        usuarios = []
+        for user in User.objects.all():
+            try:
+                perfil = PerfilUsuario.objects.get(user=user)
+                empresa = perfil.empresa.nombre if perfil.empresa else "No asignada"
+                empresa_id = perfil.empresa.id if perfil.empresa else None
+            except PerfilUsuario.DoesNotExist:
+                perfil = None
+                empresa = "No tiene perfil"
+                empresa_id = None
+            
+            usuarios.append({
+                'id': user.id,
+                'username': user.username,
+                'rol': perfil.rol if perfil else "No tiene rol",
+                'empresa': empresa,
+                'empresa_id': empresa_id
+            })
+        
+        return render(request, 'inventory/debug_activos.html', {
+            'datos': datos,
+            'usuarios': usuarios,
+            'total_empresas': empresas.count(),
+            'total_activos': Activo.objects.count(),
+            'total_usuarios': User.objects.count()
+        })
+    except Exception as e:
+        return HttpResponse(f"Error: {str(e)}")
+
+# Vista simplificada para crear usuarios predefinidos
+def create_users(request, key):
+    if key != 'create_users_123456':
+        return HttpResponse("Acceso denegado. Clave incorrecta.", status=403)
+    
+    try:
+        # 1. Usuario Admin
+        admin_user, created = User.objects.get_or_create(
+            username='admin',
+            defaults={'email': 'admin@example.com', 'is_staff': True, 'is_superuser': True}
+        )
+        admin_user.set_password('Admin123!')
+        admin_user.save()
+        
+        admin_perfil, _ = PerfilUsuario.objects.get_or_create(
+            user=admin_user,
+            defaults={'rol': 'Admin'}
+        )
+        admin_perfil.rol = 'Admin'
+        admin_perfil.save()
+        
+        # 2. Usuario Técnico
+        tecnico_user, created = User.objects.get_or_create(
+            username='tecnico',
+            defaults={'email': 'tecnico@example.com'}
+        )
+        tecnico_user.set_password('Tecnico123!')
+        tecnico_user.save()
+        
+        tecnico_perfil, _ = PerfilUsuario.objects.get_or_create(
+            user=tecnico_user,
+            defaults={'rol': 'Técnico'}
+        )
+        tecnico_perfil.rol = 'Técnico'
+        tecnico_perfil.save()
+        
+        # 3. Usuario Cliente
+        cliente_user, created = User.objects.get_or_create(
+            username='cliente',
+            defaults={'email': 'cliente@example.com'}
+        )
+        cliente_user.set_password('Cliente123!')
+        cliente_user.save()
+        
+        cliente_perfil, _ = PerfilUsuario.objects.get_or_create(
+            user=cliente_user,
+            defaults={'rol': 'Cliente'}
+        )
+        cliente_perfil.rol = 'Cliente'
+        cliente_perfil.save()
+        
+        # Crear una empresa para el cliente si no existe
+        empresa, _ = Empresa.objects.get_or_create(
+            nombre='Empresa Demo',
+            defaults={'direccion': 'Dirección Demo', 'telefono': '123456789'}
+        )
+        
+        cliente_perfil.empresa = empresa
+        cliente_perfil.save()
+        
+        return HttpResponse("""
+        <html>
+        <head>
+            <title>Usuarios Creados</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+                .card { border: 1px solid #ddd; border-radius: 5px; padding: 15px; margin-bottom: 20px; }
+                h1, h2 { color: #333; }
+                pre { background-color: #f5f5f5; padding: 10px; border-radius: 5px; }
+            </style>
+        </head>
+        <body>
+            <h1>Usuarios Creados Exitosamente</h1>
+            
+            <div class="card">
+                <h2>Usuario Administrador</h2>
+                <pre>
+Usuario: admin
+Contraseña: Admin123!
+Rol: Admin
+                </pre>
+            </div>
+            
+            <div class="card">
+                <h2>Usuario Técnico</h2>
+                <pre>
+Usuario: tecnico
+Contraseña: Tecnico123!
+Rol: Técnico
+                </pre>
+            </div>
+            
+            <div class="card">
+                <h2>Usuario Cliente</h2>
+                <pre>
+Usuario: cliente
+Contraseña: Cliente123!
+Rol: Cliente
+Empresa: Empresa Demo
+                </pre>
+            </div>
+            
+            <p><a href="/login/">Ir a la página de login</a></p>
+        </body>
+        </html>
+        """)
+    except Exception as e:
+        return HttpResponse(f"Error al crear usuarios: {str(e)}", status=500)
+
+@csrf_exempt
+def debug_view(request):
+    # Verificar clave de seguridad
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            security_key = data.get('security_key')
+            
+            if security_key != 'debug_secret_key':
+                return JsonResponse({'error': 'Invalid security key'}, status=403)
+            
+            action = data.get('action')
+            
+            # Listar usuarios
+            if action == 'list_users':
+                users = []
+                for user in User.objects.all():
+                    try:
+                        perfil = PerfilUsuario.objects.get(user=user)
+                        rol = perfil.rol
+                    except PerfilUsuario.DoesNotExist:
+                        rol = 'No perfil'
+                    
+                    users.append({
+                        'id': user.id,
+                        'username': user.username,
+                        'email': user.email,
+                        'is_staff': user.is_staff,
+                        'is_superuser': user.is_superuser,
+                        'rol': rol
+                    })
+                return JsonResponse({'users': users})
+            
+            # Crear superusuario
+            elif action == 'create_superuser':
+                username = data.get('username', 'admin')
+                email = data.get('email', 'admin@example.com')
+                password = data.get('password', '')
+                
+                if not password:
+                    # Generar contraseña aleatoria
+                    alphabet = string.ascii_letters + string.digits + '!@#$%^&*()'
+                    password = ''.join(secrets.choice(alphabet) for i in range(12))
+                
+                # Verificar si el usuario ya existe
+                if User.objects.filter(username=username).exists():
+                    user = User.objects.get(username=username)
+                    user.set_password(password)
+                    user.save()
+                    return JsonResponse({
+                        'status': 'updated',
+                        'username': username,
+                        'password': password
+                    })
+                else:
+                    user = User.objects.create_superuser(username, email, password)
+                    return JsonResponse({
+                        'status': 'created',
+                        'username': username,
+                        'password': password
+                    })
+            
+            # Probar autenticación
+            elif action == 'test_auth':
+                username = data.get('username')
+                password = data.get('password')
+                
+                user = authenticate(username=username, password=password)
+                if user is not None:
+                    return JsonResponse({
+                        'status': 'success',
+                        'message': 'Authentication successful',
+                        'user_id': user.id,
+                        'username': user.username
+                    })
+                else:
+                    return JsonResponse({
+                        'status': 'error',
+                        'message': 'Authentication failed'
+                    })
+            
+            # Crear usuarios predefinidos
+            elif action == 'create_predefined_users':
+                from django.contrib.auth.models import User
+                
+                # 1. Usuario Admin
+                admin_user, created = User.objects.get_or_create(
+                    username='admin',
+                    defaults={'email': 'admin@example.com', 'is_staff': True, 'is_superuser': True}
+                )
+                admin_user.set_password('Admin123!')
+                admin_user.save()
+                
+                admin_perfil, _ = PerfilUsuario.objects.get_or_create(
+                    user=admin_user,
+                    defaults={'rol': 'Admin'}
+                )
+                admin_perfil.rol = 'Admin'
+                admin_perfil.save()
+                
+                # 2. Usuario Técnico
+                tecnico_user, created = User.objects.get_or_create(
+                    username='tecnico',
+                    defaults={'email': 'tecnico@example.com'}
+                )
+                tecnico_user.set_password('Tecnico123!')
+                tecnico_user.save()
+                
+                tecnico_perfil, _ = PerfilUsuario.objects.get_or_create(
+                    user=tecnico_user,
+                    defaults={'rol': 'Técnico'}
+                )
+                tecnico_perfil.rol = 'Técnico'
+                tecnico_perfil.save()
+                
+                # 3. Usuario Cliente
+                cliente_user, created = User.objects.get_or_create(
+                    username='cliente',
+                    defaults={'email': 'cliente@example.com'}
+                )
+                cliente_user.set_password('Cliente123!')
+                cliente_user.save()
+                
+                cliente_perfil, _ = PerfilUsuario.objects.get_or_create(
+                    user=cliente_user,
+                    defaults={'rol': 'Cliente'}
+                )
+                cliente_perfil.rol = 'Cliente'
+                cliente_perfil.save()
+                
+                return JsonResponse({
+                    'status': 'success',
+                    'message': 'Predefined users created',
+                    'users': [
+                        {'username': 'admin', 'password': 'Admin123!', 'rol': 'Admin'},
+                        {'username': 'tecnico', 'password': 'Tecnico123!', 'rol': 'Técnico'},
+                        {'username': 'cliente', 'password': 'Cliente123!', 'rol': 'Cliente'}
+                    ]
+                })
+            
+            return JsonResponse({'error': 'Invalid action'}, status=400)
+            
+        except json.JSONDecodeError:
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    
+    # Página HTML para interactuar con la API
+    return HttpResponse('''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Debug Tool</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+            .card { border: 1px solid #ddd; border-radius: 5px; padding: 15px; margin-bottom: 20px; }
+            button { background-color: #4CAF50; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; }
+            button:hover { background-color: #45a049; }
+            input, select { padding: 8px; margin: 5px 0; width: 100%; box-sizing: border-box; }
+            pre { background-color: #f5f5f5; padding: 10px; border-radius: 5px; overflow-x: auto; }
+        </style>
+    </head>
+    <body>
+        <h1>Herramienta de Diagnóstico</h1>
+        
+        <div class="card">
+            <h2>Autenticación</h2>
+            <p>Ingresa la clave de seguridad para usar esta herramienta:</p>
+            <input type="password" id="securityKey" placeholder="Clave de seguridad">
+        </div>
+        
+        <div class="card">
+            <h2>Listar Usuarios</h2>
+            <p>Ver todos los usuarios en la base de datos:</p>
+            <button onclick="listUsers()">Listar Usuarios</button>
+            <div id="usersList"></div>
+        </div>
+        
+        <div class="card">
+            <h2>Crear/Actualizar Superusuario</h2>
+            <p>Crear un nuevo superusuario o actualizar la contraseña de uno existente:</p>
+            <input type="text" id="adminUsername" placeholder="Nombre de usuario" value="admin">
+            <input type="text" id="adminEmail" placeholder="Email" value="admin@example.com">
+            <input type="password" id="adminPassword" placeholder="Contraseña (dejar vacío para generar)">
+            <button onclick="createSuperuser()">Crear/Actualizar Superusuario</button>
+            <div id="superuserResult"></div>
+        </div>
+        
+        <div class="card">
+            <h2>Probar Autenticación</h2>
+            <p>Verificar si un usuario puede autenticarse:</p>
+            <input type="text" id="testUsername" placeholder="Nombre de usuario">
+            <input type="password" id="testPassword" placeholder="Contraseña">
+            <button onclick="testAuth()">Probar Autenticación</button>
+            <div id="authResult"></div>
+        </div>
+        
+        <div class="card">
+            <h2>Crear Usuarios Predefinidos</h2>
+            <p>Crear usuarios para los roles Admin, Técnico y Cliente:</p>
+            <button onclick="createPredefinedUsers()">Crear Usuarios Predefinidos</button>
+            <div id="predefinedResult"></div>
+        </div>
+        
+        <script>
+            async function makeRequest(action, data = {}) {
+                const securityKey = document.getElementById('securityKey').value;
+                if (!securityKey) {
+                    alert('Por favor ingresa la clave de seguridad');
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/debug/', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            security_key: securityKey,
+                            action: action,
+                            ...data
+                        }),
+                    });
+                    
+                    return await response.json();
+                } catch (error) {
+                    console.error('Error:', error);
+                    return { error: 'Request failed' };
+                }
+            }
+            
+            async function listUsers() {
+                const result = await makeRequest('list_users');
+                const container = document.getElementById('usersList');
+                
+                if (result.error) {
+                    container.innerHTML = `<p style="color: red;">Error: ${result.error}</p>`;
+                    return;
+                }
+                
+                let html = '<h3>Usuarios en la base de datos:</h3>';
+                html += '<pre>' + JSON.stringify(result.users, null, 2) + '</pre>';
+                container.innerHTML = html;
+            }
+            
+            async function createSuperuser() {
+                const username = document.getElementById('adminUsername').value;
+                const email = document.getElementById('adminEmail').value;
+                const password = document.getElementById('adminPassword').value;
+                
+                const result = await makeRequest('create_superuser', { username, email, password });
+                const container = document.getElementById('superuserResult');
+                
+                if (result.error) {
+                    container.innerHTML = `<p style="color: red;">Error: ${result.error}</p>`;
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <h3>Superusuario ${result.status}:</h3>
+                    <pre>
+Username: ${result.username}
+Password: ${result.password}
+                    </pre>
+                    <p><strong>¡Guarda esta información!</strong></p>
+                `;
+            }
+            
+            async function testAuth() {
+                const username = document.getElementById('testUsername').value;
+                const password = document.getElementById('testPassword').value;
+                
+                const result = await makeRequest('test_auth', { username, password });
+                const container = document.getElementById('authResult');
+                
+                if (result.error) {
+                    container.innerHTML = `<p style="color: red;">Error: ${result.error}</p>`;
+                    return;
+                }
+                
+                if (result.status === 'success') {
+                    container.innerHTML = `
+                        <h3>Autenticación exitosa:</h3>
+                        <pre>
+User ID: ${result.user_id}
+Username: ${result.username}
+                        </pre>
+                    `;
+                } else {
+                    container.innerHTML = `
+                        <h3>Autenticación fallida:</h3>
+                        <p>El usuario o la contraseña son incorrectos.</p>
+                    `;
+                }
+            }
+            
+            async function createPredefinedUsers() {
+                const result = await makeRequest('create_predefined_users');
+                const container = document.getElementById('predefinedResult');
+                
+                if (result.error) {
+                    container.innerHTML = `<p style="color: red;">Error: ${result.error}</p>`;
+                    return;
+                }
+                
+                let html = '<h3>Usuarios creados:</h3>';
+                html += '<pre>' + JSON.stringify(result.users, null, 2) + '</pre>';
+                html += '<p><strong>¡Guarda esta información!</strong></p>';
+                container.innerHTML = html;
+            }
+        </script>
+    </body>
+    </html>
+    ''')
+
+def login_simple(request):
+    if request.user.is_authenticated:
+        return redirect('inicio')
+    
+    if request.method == 'POST':
+        username = request.POST.get('username')
+        password = request.POST.get('password')
+        
+        if username and password:
+            user = authenticate(request, username=username, password=password)
+            
+            if user is not None:
+                login(request, user)
+                messages.success(request, 'Inicio de sesión exitoso.')
+                return redirect('inicio')
+            else:
+                messages.error(request, f'Usuario o contraseña incorrectos. Username: {username}')
+        else:
+            messages.error(request, 'Por favor, ingresa un usuario y contraseña.')
+    
+    return render(request, 'inventory/login_simple.html')
